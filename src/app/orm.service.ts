@@ -174,10 +174,6 @@ export class OrmService {
             return _ormService.myQuery;
           }
           return Reflect.get(target, prop);
-        },
-        apply: (target, that, args) => {
-          console.log(`SQLiteDBConnection.apply - target: ${target}`);
-          return Reflect.apply(target as any, that, args);
         }
       });
       return patchedConn;
@@ -187,7 +183,7 @@ export class OrmService {
   private myExecute(statement: string, transaction?: boolean) {
     // console.log(`mysqliteDBConnection.execute - statement: ${statement}`);
     if (statement.split(' ')[0].toUpperCase() !== 'SELECT') {
-      console.log(`mysqliteDBConnection.execute - statement: ${statement}`);
+      //console.log(`mysqliteDBConnection.execute - statement: ${statement}`);
       _ormService.dbSaver.next(true);
     }
     return _sqliteDBConnection.execute(statement, transaction);
@@ -197,7 +193,7 @@ export class OrmService {
     // console.log(`mysqliteDBConnection.executeSet - statement: ${JSON.stringify(set)}`);
     for (const element of set) {
       if (element.statement.split(' ')[0].toUpperCase() !== 'SELECT') {
-        console.log(`mysqliteDBConnection.executeSet - statement: ${element.statement}`);
+        //console.log(`mysqliteDBConnection.executeSet - statement: ${element.statement}`);
         _ormService.dbSaver.next(true);
         break;
       }
@@ -207,7 +203,7 @@ export class OrmService {
   // Patch method, called from Proxy object
   private myQuery(statement: string, values?: any[]) {
     if (statement.split(' ')[0].toUpperCase() !== 'SELECT') {
-      console.log(`mysqliteDBConnection.query - statement: ${JSON.stringify(statement)}`);
+      //console.log(`mysqliteDBConnection.query - statement: ${JSON.stringify(statement)}`);
       _ormService.dbSaver.next(true);
     }
     return _sqliteDBConnection.query(statement, values);
