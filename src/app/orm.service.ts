@@ -1,15 +1,36 @@
+/* eslint-disable prefer-const */
 import { Injectable } from '@angular/core';
-import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
+import { CapacitorSQLite, capSQLiteSet, SQLiteConnection, SQLiteDBConnection } from '@capacitor-community/sqlite';
+import { Capacitor } from '@capacitor/core';
+import { Subject } from 'rxjs';
+import { debounceTime, switchMap, tap } from 'rxjs/operators';
 import { User } from 'src/entities/user';
 import { MOCK_USERS } from 'src/mock-users';
 import { Connection, createConnection, getConnection } from 'typeorm';
+import { CapacitorConnectionOptions } from 'typeorm/driver/capacitor/CapacitorConnectionOptions';
 import { SQLiteService } from './services/sqlite.service';
+
+// We need these three global variables so that we can access them
+// from the Proxy patched methods.
+// eslint-disable-next-line no-underscore-dangle
+let _sqliteConnection: SQLiteConnection = null;
+// eslint-disable-next-line no-underscore-dangle
+let _sqliteDBConnection: SQLiteDBConnection = null;
+// eslint-disable-next-line no-underscore-dangle
+let _ormService: any = null;
 
 @Injectable({
   providedIn: 'root',
 })
 export class OrmService {
-  constructor(private sqlite: SQLiteService) {}
+
+  // These two are only used in web version -- for dev purposes only
+  private patchedSQLiteConnection: SQLiteConnection;
+  private dbSaver = new Subject<boolean>();
+
+  constructor(private sqlite: SQLiteService) {
+    _ormService = this;
+  }
 
   async initialize() {
     try {
@@ -20,7 +41,7 @@ export class OrmService {
       await this.createConnection();
       console.log('Connection created!');
     }
-    //await this.createMockData();
+    await this.createMockData();
     console.log('All users:', JSON.stringify(await User.find(), null, 2));
   }
 
@@ -30,9 +51,10 @@ export class OrmService {
    */
   async initializeDB() {
     await this.sqlite.initializePlugin();
-    const p = this.sqlite.platform;
-    console.log(`plaform ${p}`);
-    if (p === 'web') {
+    // const p = this.sqlite.platform;
+    // console.log(`plaform ${p}`);
+    const platform = Capacitor.getPlatform();
+    if (platform === 'web') {
       await customElements.whenDefined('jeep-sqlite');
       const jeepSqliteEl = document.querySelector('jeep-sqlite');
       if (jeepSqliteEl != null) {
@@ -81,22 +103,121 @@ export class OrmService {
     });
 
     // create a SQLite Connection Wrapper
-    const sqliteConnection = new SQLiteConnection(CapacitorSQLite);
-
+    _sqliteConnection = new SQLiteConnection(CapacitorSQLite);
+    this.patchedSQLiteConnection = _sqliteConnection;
+    if (this.sqlite.platform === 'web') {
+      this.patchSqliteConnection(_sqliteConnection);
+    }
     // copy preloaded dbs (optional, not TypeORM related):
     // the preloaded dbs must have the `YOUR_DB_NAME.db` format (i.e. including
     // the `.db` suffix, NOT including the internal `SQLITE` suffix from the plugin)
     // await sqliteConnection.copyFromAssets();
 
-    // create the TypeORM connection
-    return await createConnection({
+    const dbOptions: CapacitorConnectionOptions = {
       logging: ['error', 'query', 'schema'],
       type: 'capacitor',
-      driver: sqliteConnection, // pass the connection wrapper here
+      driver: this.patchedSQLiteConnection, // pass the connection wrapper here
       database: 'test', // database name without the `.db` suffix,
       mode: 'no-encryption',
       synchronize: true,
       entities: [User],
+      version: 1
+    };
+    // create the TypeORM connection
+    return await createConnection(dbOptions);
+  }
+
+  /**
+   * On web, patch the SQLiteConnection object so that we can detect changes
+   * to the database caused by TypeORM methods. In this case we mark the DB
+   * as pending save and issue a save after a timeout. The timeout is to prevent
+   * too frequent saves to the IndexedDB, which is needless.
+   *
+   * On a device, this function does nothing.
+   *
+   * @param conn SQLiteConnection object returned by new SQLiteConnection()
+   * @returns void
+   */
+  private patchSqliteConnection(conn: SQLiteConnection): void {
+    if (this.sqlite.platform !== 'web') {
+      return;
+    }
+    this.setupAutoSaver();
+    this.patchedSQLiteConnection = new Proxy(conn, {
+      // eslint-disable-next-line arrow-body-style
+      get: (target, prop, receiver) => {
+        if (prop.toString() === 'createConnection') {
+          console.log(`patchedSQLiteConnection.get - createConnection`);
+          return this.myCreateConnection;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+      apply: (target, that, args) => {
+        console.log(`patchedSqliteConnection - target: ${target}`);
+        return Reflect.apply(target as any, that, args);
+      }
     });
+  }
+
+  // Patch method, called from Proxy object
+  private myCreateConnection(database: string, encrypted: boolean, mode: string, version: number): Promise<SQLiteDBConnection> {
+    // console.log('myCreateConnection');
+    return _sqliteConnection.createConnection(database, encrypted, mode, version).then(conn => {
+      _sqliteDBConnection = conn;
+      const patchedConn = new Proxy(conn, {
+        get: (target, prop) => {
+          if (prop.toString() === 'execute') {
+            return _ormService.myExecute;
+          } else if (prop.toString() === 'executeSet') {
+            return _ormService.myExecuteSet;
+          } else if (prop.toString() === 'query') {
+            return _ormService.myQuery;
+          }
+          return Reflect.get(target, prop);
+        },
+        apply: (target, that, args) => {
+          console.log(`SQLiteDBConnection.apply - target: ${target}`);
+          return Reflect.apply(target as any, that, args);
+        }
+      });
+      return patchedConn;
+    });
+  }
+  // Patch method, called from Proxy object
+  private myExecute(statement: string, transaction?: boolean) {
+    // console.log(`mysqliteDBConnection.execute - statement: ${statement}`);
+    if (statement.split(' ')[0].toUpperCase() !== 'SELECT') {
+      console.log(`mysqliteDBConnection.execute - statement: ${statement}`);
+      _ormService.dbSaver.next(true);
+    }
+    return _sqliteDBConnection.execute(statement, transaction);
+  }
+  // Patch method, called from Proxy object
+  private myExecuteSet(set: capSQLiteSet[], transaction?: boolean) {
+    // console.log(`mysqliteDBConnection.executeSet - statement: ${JSON.stringify(set)}`);
+    for (const element of set) {
+      if (element.statement.split(' ')[0].toUpperCase() !== 'SELECT') {
+        console.log(`mysqliteDBConnection.executeSet - statement: ${element.statement}`);
+        _ormService.dbSaver.next(true);
+        break;
+      }
+    }
+    return _sqliteDBConnection.executeSet(set, transaction);
+  }
+  // Patch method, called from Proxy object
+  private myQuery(statement: string, values?: any[]) {
+    if (statement.split(' ')[0].toUpperCase() !== 'SELECT') {
+      console.log(`mysqliteDBConnection.query - statement: ${JSON.stringify(statement)}`);
+      _ormService.dbSaver.next(true);
+    }
+    return _sqliteDBConnection.query(statement, values);
+  }
+  // Does delayed saving of localForage db to IndexedDB
+  private setupAutoSaver() {
+    this.dbSaver.pipe(
+      debounceTime(300),
+      tap(() => console.log('Time to saveToStore..')),
+      switchMap(_ => _sqliteConnection.saveToStore('test'))
+    ).subscribe();
   }
 }
